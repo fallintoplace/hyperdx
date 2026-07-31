@@ -1,16 +1,21 @@
 import { useEffect, useRef } from 'react';
 import { useWatch } from 'react-hook-form';
 import { MetricsDataType } from '@hyperdx/common-utils/dist/types';
-import { Stack } from '@mantine/core';
+import { Stack, Text } from '@mantine/core';
 import { notifications } from '@mantine/notifications';
 
+import api from '@/api';
 import { useTablesDirect } from '@/clickhouse';
 import { DBTableSelectControlled } from '@/components/DBTableSelect';
 import { SourceSelectControlled } from '@/components/SourceSelect';
 import { useMetadataWithSettings } from '@/hooks/useMetadata';
+import { useMetricsSeriesTableAvailability } from '@/hooks/useMetricsSeriesTableAvailability';
 import { isValidMetricTable } from '@/source';
 import { useBrandDisplayName } from '@/theme/ThemeProvider';
-import { matchMetricTables } from '@/utils/metricTableAutofill';
+import {
+  matchMetricTables,
+  matchSeriesTable,
+} from '@/utils/metricTableAutofill';
 
 import { DEFAULT_DATABASE, OTEL_CLICKHOUSE_EXPRESSIONS } from './constants';
 import { FormRow } from './FormRow';
@@ -18,6 +23,8 @@ import { TableModelProps } from './types';
 
 export function MetricTableModelForm({ control, setValue }: TableModelProps) {
   const brandName = useBrandDisplayName();
+  const { data: team } = api.useTeam();
+  const isMetricsSeriesTableEnabled = !!team?.isMetricsSeriesTableEnabled;
   const databaseName = useWatch({
     control,
     name: 'from.databaseName',
@@ -25,9 +32,18 @@ export function MetricTableModelForm({ control, setValue }: TableModelProps) {
   });
   const connectionId = useWatch({ control, name: 'connection' });
   const metricTables = useWatch({ control, name: 'metricTables' });
+  const seriesTable = useWatch({ control, name: 'seriesTable' });
   const prevMetricTablesRef = useRef(metricTables);
+  const prevSeriesTableRef = useRef(seriesTable);
 
   const metadata = useMetadataWithSettings();
+
+  const metricsSeriesTableAvailability = useMetricsSeriesTableAvailability({
+    metricTables,
+    seriesTable,
+    databaseName,
+    connectionId,
+  });
 
   useEffect(() => {
     for (const [_key, _value] of Object.entries(OTEL_CLICKHOUSE_EXPRESSIONS)) {
@@ -53,7 +69,7 @@ export function MetricTableModelForm({ control, setValue }: TableModelProps) {
                 databaseName,
                 tableName: newValue as string,
                 connectionId,
-                metricType: metricType as MetricsDataType,
+                metricType,
                 metadata,
               });
               if (!isValid) {
@@ -75,6 +91,45 @@ export function MetricTableModelForm({ control, setValue }: TableModelProps) {
       }
     })();
   }, [metricTables, databaseName, connectionId, metadata]);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        if (
+          isMetricsSeriesTableEnabled &&
+          seriesTable &&
+          seriesTable !== prevSeriesTableRef.current
+        ) {
+          const isValid = await isValidMetricTable({
+            databaseName,
+            tableName: seriesTable,
+            connectionId,
+            metricType: 'series',
+            metadata,
+          });
+          if (!isValid) {
+            notifications.show({
+              color: 'red',
+              message: `${seriesTable} is not a valid OTEL series schema.`,
+            });
+          }
+        }
+        prevSeriesTableRef.current = seriesTable;
+      } catch (e) {
+        console.error(e);
+        notifications.show({
+          color: 'red',
+          message: e.message,
+        });
+      }
+    })();
+  }, [
+    seriesTable,
+    databaseName,
+    connectionId,
+    metadata,
+    isMetricsSeriesTableEnabled,
+  ]);
 
   // Auto-fill metric table dropdowns by matching table names to metric types.
   // One-shot per database+connection pair: runs once when tables load for a
@@ -101,7 +156,14 @@ export function MetricTableModelForm({ control, setValue }: TableModelProps) {
     );
 
     const entries = Object.entries(matched) as [MetricsDataType, string][];
-    if (entries.length === 0) return;
+
+    // The unified `series` table isn't a MetricsDataType, so it's matched
+    // separately and only when the series table feature is enabled for the team.
+    const seriesMatch = isMetricsSeriesTableEnabled
+      ? matchSeriesTable(tableNames, seriesTable)
+      : undefined;
+
+    if (entries.length === 0 && !seriesMatch) return;
 
     // Mark as done before async work so a rapid db switch doesn't double-fire.
     lastAutofillKeyRef.current = key;
@@ -111,8 +173,13 @@ export function MetricTableModelForm({ control, setValue }: TableModelProps) {
     (async () => {
       // Validate each candidate before setting it, so we never show a
       // green notification followed by red validation errors.
-      const validated: [MetricsDataType, string][] = [];
-      for (const [metricType, tableName] of entries) {
+      const candidates: [MetricsDataType | 'series', string][] = [...entries];
+      if (seriesMatch) {
+        candidates.push(['series', seriesMatch]);
+      }
+
+      const toApply: [string, string][] = [];
+      for (const [metricType, tableName] of candidates) {
         if (cancelled) return;
         try {
           const valid = await isValidMetricTable({
@@ -123,17 +190,21 @@ export function MetricTableModelForm({ control, setValue }: TableModelProps) {
             metadata,
           });
           if (valid) {
-            validated.push([metricType, tableName]);
+            const path =
+              metricType === 'series'
+                ? 'seriesTable'
+                : `metricTables.${metricType}`;
+            toApply.push([path, tableName]);
           }
         } catch {
           // Skip tables that fail validation (e.g. network error)
         }
       }
 
-      if (cancelled || validated.length === 0) return;
+      if (cancelled || toApply.length === 0) return;
 
-      for (const [metricType, tableName] of validated) {
-        setValue(`metricTables.${metricType}` as any, tableName);
+      for (const [path, tableName] of toApply) {
+        setValue(path as any, tableName);
       }
 
       notifications.show({
@@ -146,7 +217,13 @@ export function MetricTableModelForm({ control, setValue }: TableModelProps) {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tablesData, databaseName, connectionId, metadata]);
+  }, [
+    tablesData,
+    databaseName,
+    connectionId,
+    metadata,
+    isMetricsSeriesTableEnabled,
+  ]);
 
   return (
     <>
@@ -170,6 +247,37 @@ export function MetricTableModelForm({ control, setValue }: TableModelProps) {
             />
           </FormRow>
         ))}
+        {isMetricsSeriesTableEnabled && (
+          <FormRow
+            key="series"
+            label="series Table"
+            helpText="Table containing unique metrics series, used to accelerate metrics queries. Optional"
+          >
+            <DBTableSelectControlled
+              connectionId={connectionId}
+              database={databaseName}
+              control={control}
+              name="seriesTable"
+            />
+            {metricsSeriesTableAvailability.status === 'invalid_series' && (
+              <Text c="yellow" size="xs">
+                This table doesn&apos;t match the expected series table schema.
+              </Text>
+            )}
+            {metricsSeriesTableAvailability.status ===
+              'missing_series_hash' && (
+              <Text c="yellow" size="xs">
+                The series table cannot be used to optimize queries for some
+                metric types because the required SeriesHash column is missing
+                from the following table(s):{' '}
+                {metricsSeriesTableAvailability.missingSeriesHashTables.join(
+                  ', ',
+                )}
+                .
+              </Text>
+            )}
+          </FormRow>
+        )}
         <FormRow
           label={'Correlated Log Source'}
           helpText={`${brandName} Source for logs associated with metrics. Optional`}

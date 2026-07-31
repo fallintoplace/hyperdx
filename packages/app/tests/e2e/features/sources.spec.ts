@@ -6,8 +6,10 @@ import {
   DEFAULT_METRICS_SOURCE_NAME,
   DEFAULT_SESSIONS_SOURCE_NAME,
   DEFAULT_TRACES_SOURCE_NAME,
+  E2E_METRICS_GAUGE_TABLE,
   METADATA_MV_LOGS_SOURCE_NAME,
 } from '../utils/constants';
+import { setTeamFlag } from '../utils/db-helpers';
 
 const COMMON_FIELDS = [
   'Name',
@@ -58,6 +60,10 @@ const TRACE_FIELDS = [
 
 const SESSION_FIELDS = [...COMMON_FIELDS, 'Correlated Trace Source'];
 
+// Note: `series Table` is intentionally excluded here — it's
+// only rendered when the team's `isMetricsSeriesTableEnabled` flag is on, which is
+// off by default. See "should show series Table field when isMetricsSeriesTableEnabled
+// is on" below for the flag-enabled case.
 const METRIC_FIELDS = [
   ...COMMON_FIELDS.slice(0, -1), // Remove Table
   'gauge Table',
@@ -312,6 +318,94 @@ test.describe('Sources Functionality', { tag: ['@sources'] }, () => {
         if (serverManagedKeys.has(key)) continue;
         if (sourceBefore[key] == null) continue;
         expect(sourceAfter).toHaveProperty(key);
+      }
+    },
+  );
+
+  test(
+    'should show series Table field when isMetricsSeriesTableEnabled is on',
+    { tag: ['@full-stack'] },
+    async () => {
+      // There's no settings UI or API endpoint for this flag yet, so it's
+      // toggled directly in Mongo — see utils/db-helpers.ts.
+      setTeamFlag('isMetricsSeriesTableEnabled', true);
+      try {
+        await searchPage.goto();
+        await searchPage.sourceActionsMenu.click();
+        await searchPage.createNewSourceItem.click();
+
+        await searchPage.page
+          .getByLabel('OTEL Metrics', { exact: true })
+          .click();
+        await searchPage.sourceModalShowOptionalFields();
+
+        await expect(
+          searchPage.page.getByText('series Table', { exact: true }),
+        ).toBeVisible();
+
+        await searchPage.page.keyboard.press('Escape');
+      } finally {
+        setTeamFlag('isMetricsSeriesTableEnabled', false);
+      }
+    },
+  );
+
+  test(
+    'should warn when the configured series table does not match the series table schema',
+    { tag: ['@full-stack'] },
+    async ({ page }) => {
+      setTeamFlag('isMetricsSeriesTableEnabled', true);
+      const API_URL = getApiUrl();
+      const metricSources = await getSources(page, 'metric');
+      const existing = metricSources.find(
+        (s: any) => s.name === DEFAULT_METRICS_SOURCE_NAME,
+      );
+      expect(existing).toBeDefined();
+
+      // A minimal, isolated source (rather than editing the shared, heavily
+      // configured E2E Metrics fixture) so opening the edit form only fires
+      // the column checks this test cares about.
+      const newSourceName = 'E2E Metrics Series Check';
+      let createdSourceId = '';
+
+      try {
+        // e2e_otel_metrics_gauge is a real table but doesn't have the
+        // Date/SeriesHash/MetricType/etc. columns the series table
+        // requires, so it should be reported as an invalid series table.
+        const createResponse = await page.request.post(`${API_URL}/sources`, {
+          data: {
+            kind: 'metric',
+            name: newSourceName,
+            connection: existing.connection,
+            from: existing.from,
+            timestampValueExpression: existing.timestampValueExpression,
+            resourceAttributesExpression: existing.resourceAttributesExpression,
+            metricTables: {
+              gauge: E2E_METRICS_GAUGE_TABLE,
+            },
+            seriesTable: E2E_METRICS_GAUGE_TABLE,
+          },
+        });
+        expect(createResponse.ok()).toBeTruthy();
+        const created = await createResponse.json();
+        createdSourceId = created._id;
+
+        // The /search page's source selector only lists Log/Trace sources
+        // (see ALLOWED_SOURCE_KINDS in DBSearchPage.tsx), so a Metric source
+        // can't be reached via searchPage.selectSource(). Navigating to
+        // `/team#source-<id>` auto-expands that source's inline edit form
+        // instead (see the hash-handling effect in SourcesList.tsx).
+        await page.goto(`/team#source-${createdSourceId}`);
+        await searchPage.sourceModalShowOptionalFields();
+
+        await expect(
+          page.getByText(
+            "This table doesn't match the expected series table schema.",
+          ),
+        ).toBeVisible({ timeout: 20000 });
+      } finally {
+        await page.request.delete(`${API_URL}/sources/${createdSourceId}`);
+        setTeamFlag('isMetricsSeriesTableEnabled', false);
       }
     },
   );
